@@ -1,14 +1,13 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
-// API Key TMDB kau dah dimasukkan di sini
 const TMDB_API_KEY = "5c64e613c6ecd85d8b536feb9e653c9e"; 
 
 const manifest = {
     id: "org.nuvio.perfectcatalog",
-    version: "1.0.2",
+    version: "1.0.3", // Versi diperbarui
     name: "Perfect Nuvio Catalog",
-    description: "Katalog sempurna: Movies & Series (Tanpa Anime) + Anime Khusus dengan Episode",
+    description: "Katalog sempurna dengan perbaikan Episode TV Series & Anime",
     types: ["movie", "series", "anime"],
     catalogs: [
         { type: "movie", id: "movie.trending", name: "Trending Movies", extra: [{ name: "search", isRequired: false }] },
@@ -16,15 +15,14 @@ const manifest = {
         { type: "anime", id: "anime.trending", name: "Trending Anime", extra: [{ name: "search", isRequired: false }] }
     ],
     resources: ["catalog", "meta"],
-    idPrefixes: ["tmdb:", "anilist:"] // Wajib pakai anilist: supaya stream provider boleh baca
+    idPrefixes: ["tmdb:", "anilist:"] 
 };
 
 const builder = new addonBuilder(manifest);
 
-// FUNGSI PENAPISAN: Buang anime dari Movies dan Series
 function isAnime(item) {
     const isJapanese = item.original_language === "ja";
-    const isAnimation = item.genre_ids && item.genre_ids.includes(16); // 16 = Animation di TMDB
+    const isAnimation = item.genre_ids && item.genre_ids.includes(16); 
     return isJapanese && isAnimation;
 }
 
@@ -32,21 +30,15 @@ function isAnime(item) {
 builder.defineCatalogHandler(async (args) => {
     let metas = [];
 
-    // JIKA USER BUKA KATALOG MOVIE ATAU SERIES
     if (args.type === "movie" || args.type === "series") {
         const typeUrl = args.type === "movie" ? "movie" : "tv";
-        
         try {
             let url = `https://api.themoviedb.org/3/trending/${typeUrl}/week?api_key=${TMDB_API_KEY}`;
             if (args.extra.search) {
                 url = `https://api.themoviedb.org/3/search/${typeUrl}?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(args.extra.search)}`;
             }
-
             const response = await axios.get(url);
-            const results = response.data.results;
-
-            // Tapis: Buang anime dari senarai
-            const filteredResults = results.filter(item => !isAnime(item));
+            const filteredResults = response.data.results.filter(item => !isAnime(item));
 
             metas = filteredResults.map(item => ({
                 id: `tmdb:${item.id}`,
@@ -57,55 +49,38 @@ builder.defineCatalogHandler(async (args) => {
                 description: item.overview,
                 releaseInfo: (item.release_date || item.first_air_date || "").substring(0, 4)
             }));
-        } catch (error) {
-            console.error("Error fetching TMDB:", error.message);
-        }
+        } catch (error) { console.error(error); }
 
-    // JIKA USER BUKA KATALOG ANIME (GUNA ANILIST)
     } else if (args.type === "anime") {
         try {
             const query = `
             query ($search: String, $sort: [MediaSort]) {
                 Page(perPage: 30) {
                     media(search: $search, type: ANIME, sort: $sort) {
-                        id
-                        title { romaji english }
-                        coverImage { extraLarge }
-                        bannerImage
-                        description
-                        startDate { year }
+                        id title { romaji english } coverImage { extraLarge } bannerImage description startDate { year }
                     }
                 }
             }`;
-
             let variables = { sort: ["TRENDING_DESC"] };
-            if (args.extra.search) {
-                variables = { search: args.extra.search };
-            }
+            if (args.extra.search) variables = { search: args.extra.search };
 
             const response = await axios.post("https://graphql.anilist.co", { query, variables });
-            const results = response.data.data.Page.media;
-
-            metas = results.map(item => ({
+            metas = response.data.data.Page.media.map(item => ({
                 id: `anilist:${item.id}`,
-                type: "series", // Paksa jadi 'series' kat sini supaya Nuvio keluar senarai episod!
+                type: "series",
                 name: item.title.english || item.title.romaji,
                 poster: item.coverImage.extraLarge,
                 background: item.bannerImage,
                 description: (item.description || "").replace(/<[^>]*>?/gm, ''),
                 releaseInfo: item.startDate.year ? item.startDate.year.toString() : "N/A"
             }));
-        } catch (error) {
-            console.error("Error fetching AniList:", error.message);
-        }
+        } catch (error) { console.error(error); }
     }
-
     return { metas };
 });
 
-// ---------------- HANDLER UNTUK METADATA (Details & Episodes) ---------------- //
+// ---------------- HANDLER UNTUK METADATA & EPISODE ---------------- //
 builder.defineMetaHandler(async (args) => {
-    // KLIK PADA MOVIE/SERIES BIASA
     if (args.id.startsWith("tmdb:")) {
         const tmdbId = args.id.split(":")[1];
         const typeUrl = args.type === "movie" ? "movie" : "tv";
@@ -121,6 +96,29 @@ builder.defineMetaHandler(async (args) => {
                 if (trailer) trailerId = trailer.key;
             }
 
+            let videos = [];
+            // PERBAIKAN: Menarik data musim dan episode untuk TV Series
+            if (typeUrl === "tv" && item.seasons) {
+                for (let season of item.seasons) {
+                    if (season.season_number > 0) { // Lewati season 0 (Special)
+                        try {
+                            const seasonUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${season.season_number}?api_key=${TMDB_API_KEY}`;
+                            const seasonData = await axios.get(seasonUrl);
+                            for (let ep of seasonData.data.episodes) {
+                                videos.push({
+                                    id: `tmdb:${tmdbId}:${season.season_number}:${ep.episode_number}`,
+                                    title: ep.name || `Episode ${ep.episode_number}`,
+                                    season: season.season_number,
+                                    episode: ep.episode_number,
+                                    thumbnail: ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : null,
+                                    overview: ep.overview
+                                });
+                            }
+                        } catch (e) { console.error(`Gagal memuat musim ${season.season_number}`); }
+                    }
+                }
+            }
+
             return {
                 meta: {
                     id: args.id,
@@ -130,15 +128,12 @@ builder.defineMetaHandler(async (args) => {
                     background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
                     description: item.overview,
                     releaseInfo: (item.release_date || item.first_air_date || "").substring(0, 4),
-                    trailers: trailerId ? [{ source: trailerId, type: "Trailer" }] : []
+                    trailers: trailerId ? [{ source: trailerId, type: "Trailer" }] : [],
+                    videos: typeUrl === "tv" ? videos : undefined
                 }
             };
-        } catch (error) {
-            console.error("TMDB Meta Error:", error.message);
-            return { meta: {} };
-        }
+        } catch (error) { console.error(error); return { meta: {} }; }
 
-    // KLIK PADA ANIME
     } else if (args.id.startsWith("anilist:")) {
         const alId = args.id.split(":")[1];
         
@@ -146,14 +141,7 @@ builder.defineMetaHandler(async (args) => {
             const query = `
             query ($id: Int) {
                 Media(id: $id, type: ANIME) {
-                    id
-                    title { romaji english }
-                    coverImage { extraLarge }
-                    bannerImage
-                    description
-                    startDate { year }
-                    episodes
-                    trailer { id site }
+                    id title { romaji english } coverImage { extraLarge } bannerImage description startDate { year } episodes trailer { id site }
                 }
             }`;
 
@@ -165,14 +153,13 @@ builder.defineMetaHandler(async (args) => {
                 trailerInfo = [{ source: item.trailer.id, type: "Trailer" }];
             }
 
-            // BINA DAFTAR EPISODE AUTMATIK
-            const totalEpisodes = item.episodes || 24; // Kalau episod tak letak/ongoing, kita bagi 24 default
+            const totalEpisodes = item.episodes || 24; 
             let videos = [];
             for (let i = 1; i <= totalEpisodes; i++) {
                 videos.push({
-                    id: `anilist:${item.id}:${i}`, // ID ni yang stream provider perlukan!
-                    title: `Episode ${i}`,
-                    season: 1,
+                    id: `anilist:${item.id}:${i}`,
+                    title: `Episode ${i}`, 
+                    season: 1, 
                     episode: i
                 });
             }
@@ -180,23 +167,19 @@ builder.defineMetaHandler(async (args) => {
             return {
                 meta: {
                     id: `anilist:${item.id}`,
-                    type: "series", // WAJIB siri supaya tak keluar 'Movie Details' lagi
+                    type: "series",
                     name: item.title.english || item.title.romaji,
                     poster: item.coverImage.extraLarge,
                     background: item.bannerImage,
                     description: (item.description || "").replace(/<[^>]*>?/gm, ''),
                     releaseInfo: item.startDate.year ? item.startDate.year.toString() : "N/A",
                     trailers: trailerInfo,
-                    videos: videos // Masukkan episod ke dalam Nuvio
+                    videos: videos
                 }
             };
-        } catch (error) {
-            console.error("AniList Meta Error:", error.message);
-            return { meta: {} };
-        }
+        } catch (error) { console.error(error); return { meta: {} }; }
     }
 });
 
-// Jalankan Addon
 serveHTTP(builder.getInterface(), { port: process.env.PORT || 7000 });
 console.log("Nuvio Perfect Catalog Addon is running!");
