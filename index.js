@@ -5,9 +5,9 @@ const TMDB_API_KEY = "5c64e613c6ecd85d8b536feb9e653c9e";
 
 const manifest = {
     id: "org.nuvio.perfectcatalog",
-    version: "1.0.3", // Versi diperbarui
+    version: "1.0.5",
     name: "Perfect Nuvio Catalog",
-    description: "Katalog sempurna dengan perbaikan Episode TV Series & Anime",
+    description: "Katalog sempurna dengan Native IMDB Meta & Anilist Meta",
     types: ["movie", "series", "anime"],
     catalogs: [
         { type: "movie", id: "movie.trending", name: "Trending Movies", extra: [{ name: "search", isRequired: false }] },
@@ -15,7 +15,8 @@ const manifest = {
         { type: "anime", id: "anime.trending", name: "Trending Anime", extra: [{ name: "search", isRequired: false }] }
     ],
     resources: ["catalog", "meta"],
-    idPrefixes: ["tmdb:", "anilist:"] 
+    // Hanya anime yang perlukan metadata khas dari kita
+    idPrefixes: ["anilist:"] 
 };
 
 const builder = new addonBuilder(manifest);
@@ -40,15 +41,32 @@ builder.defineCatalogHandler(async (args) => {
             const response = await axios.get(url);
             const filteredResults = response.data.results.filter(item => !isAnime(item));
 
-            metas = filteredResults.map(item => ({
-                id: `tmdb:${item.id}`,
-                type: args.type,
-                name: item.title || item.name,
-                poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
-                background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
-                description: item.overview,
-                releaseInfo: (item.release_date || item.first_air_date || "").substring(0, 4)
-            }));
+            // FUNGSI MAGIK: Tukar TMDB ID kepada IMDB ID secara automatik supaya Nuvio boleh proses episod
+            const metasPromises = filteredResults.map(async (item) => {
+                let finalId = `tmdb:${item.id}`; // Backup ID kalau tak jumpa IMDB
+                try {
+                    const extUrl = `https://api.themoviedb.org/3/${typeUrl}/${item.id}/external_ids?api_key=${TMDB_API_KEY}`;
+                    const extRes = await axios.get(extUrl);
+                    if (extRes.data && extRes.data.imdb_id) {
+                        finalId = extRes.data.imdb_id; // Guna IMDB ID (contoh: tt1234567)
+                    }
+                } catch (e) {
+                    // Abaikan jika ralat luaran
+                }
+
+                return {
+                    id: finalId,
+                    type: args.type,
+                    name: item.title || item.name,
+                    poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+                    background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
+                    description: item.overview,
+                    releaseInfo: (item.release_date || item.first_air_date || "").substring(0, 4)
+                };
+            });
+
+            metas = await Promise.all(metasPromises);
+
         } catch (error) { console.error(error); }
 
     } else if (args.type === "anime") {
@@ -79,62 +97,11 @@ builder.defineCatalogHandler(async (args) => {
     return { metas };
 });
 
-// ---------------- HANDLER UNTUK METADATA & EPISODE ---------------- //
+// ---------------- HANDLER UNTUK METADATA (KHAS ANIME SAHAJA) ---------------- //
 builder.defineMetaHandler(async (args) => {
-    if (args.id.startsWith("tmdb:")) {
-        const tmdbId = args.id.split(":")[1];
-        const typeUrl = args.type === "movie" ? "movie" : "tv";
-        
-        try {
-            const url = `https://api.themoviedb.org/3/${typeUrl}/${tmdbId}?api_key=${TMDB_API_KEY}&append_to_response=videos`;
-            const response = await axios.get(url);
-            const item = response.data;
-            
-            let trailerId = null;
-            if (item.videos && item.videos.results) {
-                const trailer = item.videos.results.find(v => v.type === "Trailer" && v.site === "YouTube");
-                if (trailer) trailerId = trailer.key;
-            }
-
-            let videos = [];
-            // PERBAIKAN: Menarik data musim dan episode untuk TV Series
-            if (typeUrl === "tv" && item.seasons) {
-                for (let season of item.seasons) {
-                    if (season.season_number > 0) { // Lewati season 0 (Special)
-                        try {
-                            const seasonUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${season.season_number}?api_key=${TMDB_API_KEY}`;
-                            const seasonData = await axios.get(seasonUrl);
-                            for (let ep of seasonData.data.episodes) {
-                                videos.push({
-                                    id: `tmdb:${tmdbId}:${season.season_number}:${ep.episode_number}`,
-                                    title: ep.name || `Episode ${ep.episode_number}`,
-                                    season: season.season_number,
-                                    episode: ep.episode_number,
-                                    thumbnail: ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : null,
-                                    overview: ep.overview
-                                });
-                            }
-                        } catch (e) { console.error(`Gagal memuat musim ${season.season_number}`); }
-                    }
-                }
-            }
-
-            return {
-                meta: {
-                    id: args.id,
-                    type: args.type,
-                    name: item.title || item.name,
-                    poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
-                    background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
-                    description: item.overview,
-                    releaseInfo: (item.release_date || item.first_air_date || "").substring(0, 4),
-                    trailers: trailerId ? [{ source: trailerId, type: "Trailer" }] : [],
-                    videos: typeUrl === "tv" ? videos : undefined
-                }
-            };
-        } catch (error) { console.error(error); return { meta: {} }; }
-
-    } else if (args.id.startsWith("anilist:")) {
+    
+    // Metadata untuk Movies/Series tak perlu ditulis di sini, Nuvio akan buat secara automatik guna IMDB ID
+    if (args.id.startsWith("anilist:")) {
         const alId = args.id.split(":")[1];
         
         try {
@@ -178,6 +145,8 @@ builder.defineMetaHandler(async (args) => {
                 }
             };
         } catch (error) { console.error(error); return { meta: {} }; }
+    } else {
+        return { meta: {} };
     }
 });
 
