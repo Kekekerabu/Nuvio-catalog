@@ -5,10 +5,10 @@ const axios = require("axios");
 const TMDB_API_KEY = "5c64e613c6ecd85d8b536feb9e653c9e"; 
 
 const manifest = {
-    id: "org.nuvio.perfectcatalog.v2",
-    version: "2.0.0",
-    name: "Perfect Nuvio Catalog v2",
-    description: "IMDb Native (Movies/Series) & Kitsu (Sokongan Penuh Ani.pm)",
+    id: "org.nuvio.perfectcatalog.v3",
+    version: "3.0.0",
+    name: "Perfect Nuvio Catalog v3",
+    description: "Katalog Auto-Meta: TV Series Cepat & Anime 1000+ Episod",
     types: ["movie", "series", "anime"],
     catalogs: [
         { type: "movie", id: "movie.trending", name: "Trending Movies", extra: [{ name: "search", isRequired: false }] },
@@ -16,8 +16,9 @@ const manifest = {
         { type: "anime", id: "anime.trending", name: "Trending Anime", extra: [{ name: "search", isRequired: false }] }
     ],
     resources: ["catalog", "meta"],
-    // Kunci Rahsia: Nuvio sangat sensitif. Kita mesti bagi ID IMDb ('tt') untuk Series, dan 'kitsu:' untuk Anime.
-    idPrefixes: ["tt", "kitsu:"] 
+    // FIX BESAR 1: Kita sengaja BUANG "tt" kat sini. Bila kita tak letak "tt", Nuvio takkan minta details movie/series dari kita. 
+    // Dia akan automatik rujuk pangkalan datanya sendiri (Cinemeta) yang jauh lebih laju dan lengkap episodnya!
+    idPrefixes: ["kitsu:"] 
 };
 
 const builder = new addonBuilder(manifest);
@@ -32,7 +33,6 @@ function isAnime(item) {
 builder.defineCatalogHandler(async (args) => {
     let metas = [];
 
-    // --- A. MOVIES & TV SERIES (GUNA TMDB -> TUKAR KE IMDB) ---
     if (args.type === "movie" || args.type === "series") {
         const typeUrl = args.type === "movie" ? "movie" : "tv";
         try {
@@ -44,7 +44,6 @@ builder.defineCatalogHandler(async (args) => {
             
             const filteredResults = response.data.results.filter(item => !isAnime(item));
             
-            // Tarik IMDb ID serentak
             const metasPromises = filteredResults.map(async (item) => {
                 let imdbId = null;
                 try {
@@ -53,11 +52,10 @@ builder.defineCatalogHandler(async (args) => {
                     imdbId = extRes.data.imdb_id;
                 } catch (e) {}
 
-                // Jika takde IMDb ID, kita tak masukkan dalam list, sebab Nuvio perlukan IMDb ID untuk keluarkan episod
                 if (!imdbId) return null; 
 
                 return {
-                    id: imdbId, // Guna ID tt... (Contoh: tt0944947)
+                    id: imdbId, 
                     type: args.type,
                     name: item.title || item.name,
                     poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
@@ -67,11 +65,10 @@ builder.defineCatalogHandler(async (args) => {
             });
             
             const resolved = await Promise.all(metasPromises);
-            metas = resolved.filter(m => m !== null); // Buang yang null
+            metas = resolved.filter(m => m !== null); 
 
         } catch (error) { console.error(error); }
 
-    // --- B. ANIME (TUKAR KE KITSU API) ---
     } else if (args.type === "anime") {
         try {
             let url = "https://kitsu.io/api/edge/trending/anime";
@@ -99,10 +96,9 @@ builder.defineCatalogHandler(async (args) => {
 });
 
 // ---------------- 2. HANDLER METADATA ---------------- //
-// Kita TAK BUAT meta handler untuk Movies/Series. Bila kita pass IMDb ID dari katalog, Nuvio (Cinemeta) akan automatik uruskan metadata yang sempurna!
 builder.defineMetaHandler(async (args) => {
     
-    // HANYA URUSKAN ANIME SAHAJA DI SINI
+    // HANYA URUSKAN ANIME (KITSU) SAHAJA. (Movies/Series diuruskan automatik oleh Nuvio sebab kita tak letak 'tt' kat idPrefixes atas)
     if (args.id.startsWith("kitsu:")) {
         const kitsuId = args.id.split(":")[1];
         
@@ -111,34 +107,34 @@ builder.defineMetaHandler(async (args) => {
             const response = await axios.get(url);
             const attrs = response.data.data.attributes;
 
-            // Dapatkan senarai episod dari Kitsu
-            let videos = [];
-            try {
-                const epUrl = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?page[limit]=200`;
-                const epRes = await axios.get(epUrl);
-                videos = epRes.data.data.map(ep => {
-                    const epAttrs = ep.attributes;
-                    return {
-                        id: `kitsu:${kitsuId}:${epAttrs.relativeNumber}`,
-                        title: epAttrs.titles.en_jp || `Episode ${epAttrs.relativeNumber}`,
-                        season: 1,
-                        episode: epAttrs.relativeNumber,
-                        thumbnail: epAttrs.thumbnail ? epAttrs.thumbnail.original : null
-                    };
-                });
-            } catch (e) { console.error("Error fetching Kitsu episodes"); }
+            let totalEpisodes = attrs.episodeCount;
 
-            // Jika tiada senarai episod dari API, buat fallback senarai episod
-            if (videos.length === 0) {
-                const totalEpisodes = attrs.episodeCount || 24; 
-                for (let i = 1; i <= totalEpisodes; i++) {
-                    videos.push({
-                        id: `kitsu:${kitsuId}:${i}`,
-                        title: `Episode ${i}`, 
-                        season: 1, 
-                        episode: i
-                    });
+            // FIX BESAR 2: Kalau anime macam One Piece masih Ongoing, episodeCount di Kitsu adalah "null".
+            // Kita selesaikan dengan buat carian berbalik (reverse search) untuk cari episod yang paling terkini!
+            if (!totalEpisodes) {
+                try {
+                    const lastEpUrl = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?sort=-number&page[limit]=1`;
+                    const lastEpRes = await axios.get(lastEpUrl);
+                    if (lastEpRes.data && lastEpRes.data.data && lastEpRes.data.data.length > 0) {
+                        totalEpisodes = lastEpRes.data.data[0].attributes.number;
+                    }
+                } catch (e) {
+                    console.error("Gagal cari episod terkini dari Kitsu");
                 }
+            }
+
+            // Fallback terakhir jika semua gagal
+            totalEpisodes = totalEpisodes || 24; 
+
+            // Bina senarai episod (Dari 1 sampai 1000+ dengan laju)
+            let videos = [];
+            for (let i = 1; i <= totalEpisodes; i++) {
+                videos.push({
+                    id: `kitsu:${kitsuId}:${i}`,
+                    title: `Episode ${i}`, 
+                    season: 1, 
+                    episode: i
+                });
             }
 
             let trailerInfo = [];
@@ -177,5 +173,5 @@ app.use((req, res, next) => {
 app.use("/", getRouter(builder.getInterface()));
 
 app.listen(port, "0.0.0.0", () => {
-    console.log(`Nuvio Perfect Catalog v2 Server running on port ${port}`);
+    console.log(`Nuvio Perfect Catalog v3 Server running on port ${port}`);
 });
